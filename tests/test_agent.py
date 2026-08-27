@@ -1,5 +1,10 @@
 from copy import deepcopy
+from io import StringIO
 import json
+import os
+import shlex
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -10,6 +15,7 @@ from llm_client import LLMClientError, LLMResponse, ToolCall
 from tools.base import ToolResult
 from tools.registry import ToolRegistry, register_local_tools
 from tools.workspace import Workspace
+from trace_logger import TraceLogger
 
 
 class FakeLLMClient:
@@ -442,6 +448,7 @@ def test_registered_local_tools_write_file_and_share_modified_state(
                         arguments={
                             "summary": "Created result.txt.",
                             "verification": "File write returned success.",
+                            "limitations": "No command verification was available in this focused test.",
                         },
                     )
                 ]
@@ -470,6 +477,292 @@ def test_registered_local_tools_write_file_and_share_modified_state(
         "run_command",
         "finish",
     }
+
+
+def test_finish_requires_successful_verification_after_edit(tmp_path: Any) -> None:
+    registry = ToolRegistry()
+    command = _python_command("print('verified')")
+    fake = FakeLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-write",
+                        name="write_file",
+                        arguments={"path": "module.py", "content": "value = 1\n"},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-early-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Too early.",
+                            "verification": "Not actually run.",
+                        },
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-verify",
+                        name="run_command",
+                        arguments={"command": command},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Verified edit.",
+                            "verification": "Verification command exited with code 0.",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = AgentCore(fake, registry, "Edit then verify", max_steps=5)
+    register_local_tools(registry, Workspace(tmp_path), agent.state.modified_files)
+
+    result = agent.run()
+
+    assert result.success is True
+    assert agent.state.last_edit_step == 1
+    assert agent.state.verification_runs[0]["command"] == command
+    assert agent.state.verification_runs[0]["step"] == 3
+    assert agent.state.verification_runs[0]["exit_code"] == 0
+    assert agent.state.verification_runs[0]["success"] is True
+    early_finish = json.loads(fake.requests[2]["messages"][-1]["content"])
+    assert early_finish["success"] is False
+    assert early_finish["metadata"]["error_type"] == "verification_required"
+    assert "run_command" in early_finish["error"]
+
+
+def test_finish_allows_explicit_verification_limitation_after_edit(tmp_path: Any) -> None:
+    registry = ToolRegistry()
+    fake = FakeLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-write",
+                        name="write_file",
+                        arguments={"path": "module.py", "content": "value = 1\n"},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Edited module.",
+                            "verification": "No verification command was run.",
+                            "limitations": "The required runtime is unavailable.",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = AgentCore(fake, registry, "Edit without available runtime")
+    register_local_tools(registry, Workspace(tmp_path), agent.state.modified_files)
+
+    result = agent.run()
+
+    assert result.success is True
+    assert agent.state.final_limitations == "The required runtime is unavailable."
+
+
+def test_verification_before_later_edit_in_same_step_does_not_cover_edit(
+    tmp_path: Any,
+) -> None:
+    registry = ToolRegistry()
+    command = _python_command("print('verified too early')")
+    fake = FakeLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-verify-first",
+                        name="run_command",
+                        arguments={"command": command},
+                    ),
+                    ToolCall(
+                        id="call-edit-second",
+                        name="write_file",
+                        arguments={"path": "module.py", "content": "value = 1\n"},
+                    ),
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-early-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Too early.",
+                            "verification": "The command ran before the edit.",
+                        },
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-limited-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Stopped with an explicit limitation.",
+                            "verification": "The edit was not verified.",
+                            "limitations": "No later verification could be run.",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = AgentCore(fake, registry, "Verify ordering", max_steps=4)
+    register_local_tools(registry, Workspace(tmp_path), agent.state.modified_files)
+
+    result = agent.run()
+
+    assert result.success is True
+    rejected = json.loads(fake.requests[2]["messages"][-1]["content"])
+    assert rejected["metadata"]["error_type"] == "verification_required"
+
+
+def test_edit_failed_verification_fix_successful_verification_then_finish(
+    tmp_path: Any,
+) -> None:
+    secret = "sk-test-secret-must-not-appear"
+    trace_output = StringIO()
+    registry = ToolRegistry()
+    verify_command = _python_module_command("py_compile", "module.py")
+    broken = "def broken(:\n    return '" + secret + "'\n"
+    fixed = "def fixed():\n    return 'ok'\n"
+    fake = FakeLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-write",
+                        name="write_file",
+                        arguments={"path": "module.py", "content": broken},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-failed-verify",
+                        name="run_command",
+                        arguments={"command": verify_command},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-fix",
+                        name="replace_text",
+                        arguments={
+                            "path": "module.py",
+                            "old_text": broken,
+                            "new_text": fixed,
+                        },
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-success-verify",
+                        name="run_command",
+                        arguments={"command": verify_command},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Fixed module syntax.",
+                            "verification": "py_compile exited with code 0.",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = AgentCore(
+        fake,
+        registry,
+        "Repair module.py",
+        trace_logger=TraceLogger(stream=trace_output, secrets=[secret]),
+    )
+    register_local_tools(registry, Workspace(tmp_path), agent.state.modified_files)
+
+    result = agent.run()
+
+    assert result.success is True
+    assert (tmp_path / "module.py").read_text(encoding="utf-8") == fixed
+    assert agent.state.last_edit_step == 3
+    assert [run["success"] for run in agent.state.verification_runs] == [False, True]
+    assert [run["step"] for run in agent.state.verification_runs] == [2, 4]
+    assert [run["exit_code"] for run in agent.state.verification_runs] == [1, 0]
+    rendered_trace = trace_output.getvalue()
+    assert "Step 1 · EDIT" in rendered_trace
+    assert "Step 2 · VERIFY" in rendered_trace
+    assert "Step 3 · EDIT" in rendered_trace
+    assert "Step 4 · VERIFY" in rendered_trace
+    assert "Step 5 · DONE" in rendered_trace
+    assert "Changed files: module.py" in rendered_trace
+    assert "Final verification: SUCCESS" in rendered_trace
+    assert secret not in rendered_trace
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["set", "powershell -Command Get-ChildItem Env:"],
+)
+def test_trace_does_not_print_run_command_environment_output(command: str) -> None:
+    trace_output = StringIO()
+    secret = "ordinary-environment-value-not-matching-token-patterns"
+    logger = TraceLogger(stream=trace_output)
+
+    logger.log_tool(
+        step=1,
+        tool_name="run_command",
+        arguments={"command": command},
+        result=ToolResult(
+            success=True,
+            output=f"HARMLESS_NAME={secret}",
+            metadata={
+                "exit_code": 0,
+                "timed_out": False,
+                "output_truncated": False,
+            },
+        ),
+        changed_files=set(),
+        verification_runs=[],
+        verification_current=True,
+    )
+
+    rendered = trace_output.getvalue()
+    assert secret not in rendered
+    assert "exit_code=0" in rendered
+    assert "output_chars=" in rendered
 
 
 def test_cli_runs_real_agent_composition_with_fake_llm(
@@ -524,3 +817,21 @@ def test_cli_reports_configuration_error_without_starting_agent(
     assert exit_code == 2
     assert captured.out == ""
     assert "Missing required environment variables" in captured.err
+
+
+def _python_command(code: str) -> str:
+    arguments = [sys.executable, "-c", code]
+    return (
+        subprocess.list2cmdline(arguments)
+        if os.name == "nt"
+        else shlex.join(arguments)
+    )
+
+
+def _python_module_command(module: str, path: str) -> str:
+    arguments = [sys.executable, "-m", module, path]
+    return (
+        subprocess.list2cmdline(arguments)
+        if os.name == "nt"
+        else shlex.join(arguments)
+    )

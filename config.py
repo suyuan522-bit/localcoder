@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import os
 
 MAX_STEPS = 30
+MAX_DYNAMIC_MESSAGES = 24
 READ_FILE_MAX_LINES = 200
 LIST_FILES_MAX_ENTRIES = 500
 SEARCH_MAX_MATCHES = 100

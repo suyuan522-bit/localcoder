@@ -10,11 +10,10 @@ from config import (
     READ_FILE_MAX_LINES,
     SEARCH_MAX_MATCHES,
 )
-from tools.base import ToolResult
+from tools.base import ToolResult, truncate_text
 from tools.workspace import Workspace, WorkspaceBoundaryError
 
 IGNORED_NAMES = {".git", ".pytest_cache", ".venv", "venv", "__pycache__"}
-_OUTPUT_TRUNCATION_MARKER = "\n[output truncated]\n"
 
 
 def _failure(error: str, **metadata: object) -> ToolResult:
@@ -22,15 +21,7 @@ def _failure(error: str, **metadata: object) -> ToolResult:
 
 
 def _bounded_output(text: str) -> tuple[str, bool]:
-    if len(text) <= MAX_TOOL_OUTPUT_CHARS:
-        return text, False
-    available = MAX_TOOL_OUTPUT_CHARS - len(_OUTPUT_TRUNCATION_MARKER)
-    head_size = available // 2
-    tail_size = available - head_size
-    return (
-        text[:head_size] + _OUTPUT_TRUNCATION_MARKER + text[-tail_size:],
-        True,
-    )
+    return truncate_text(text, MAX_TOOL_OUTPUT_CHARS)
 
 
 def _read_text(path: Path) -> str:
@@ -264,7 +255,7 @@ def write_file(
         if target.exists() and target.is_dir():
             return _failure(f"Path is a directory: {path}", path=path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_bytes(content.encode("utf-8"))
         relative = workspace.relative(target)
         if modified_files is not None:
             modified_files.add(relative)

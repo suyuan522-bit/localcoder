@@ -167,6 +167,13 @@ def test_write_file_creates_parents_and_tracks_modified_path(tmp_path: Path) -> 
     assert result.metadata["path"] == "nested/new.txt"
 
 
+def test_write_file_preserves_requested_newline_bytes(tmp_path: Path) -> None:
+    result = write_file(Workspace(tmp_path), "newlines.txt", "one\ntwo\n")
+
+    assert result.success is True
+    assert (tmp_path / "newlines.txt").read_bytes() == b"one\ntwo\n"
+
+
 def test_replace_text_replaces_one_exact_match_and_tracks_file(tmp_path: Path) -> None:
     target = tmp_path / "app.py"
     target.write_text("before = 1\nafter = before\n", encoding="utf-8")

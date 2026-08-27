@@ -11,6 +11,7 @@ from config import ConfigurationError, load_llm_config
 from llm_client import LLMClient
 from tools.registry import ToolRegistry, register_local_tools
 from tools.workspace import Workspace
+from trace_logger import TraceLogger
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,7 +37,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_llm_config()
         workspace = Workspace(args.workspace)
         registry = ToolRegistry()
-        agent = AgentCore(LLMClient(config), registry, args.task)
+        agent = AgentCore(
+            LLMClient(config),
+            registry,
+            args.task,
+            trace_logger=TraceLogger(secrets=[config.api_key]),
+        )
         register_local_tools(
             registry,
             workspace,

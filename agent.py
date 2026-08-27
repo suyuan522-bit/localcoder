@@ -7,10 +7,12 @@ import json
 from typing import Any
 
 from config import MAX_STEPS
+from context import ContextManager
 from llm_client import LLMClientError, LLMResponse, ToolCall
 from prompts import SYSTEM_PROMPT
-from tools.base import ToolResult
+from tools.base import ToolResult, truncate_text
 from tools.registry import ToolRegistry
+from trace_logger import TraceLogger
 
 
 @dataclass(slots=True)
@@ -46,6 +48,8 @@ class AgentCore:
         registry: ToolRegistry,
         task: str,
         max_steps: int = MAX_STEPS,
+        context_manager: ContextManager | None = None,
+        trace_logger: TraceLogger | None = None,
     ) -> None:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("task must be a non-empty string")
@@ -59,22 +63,39 @@ class AgentCore:
         self._llm_client = llm_client
         self._registry = registry
         self._max_steps = max_steps
+        self._context = context_manager or ContextManager(SYSTEM_PROMPT, task)
+        self._trace = trace_logger
+        self._tool_sequence = 0
+        self._last_edit_sequence: int | None = None
+        self._latest_successful_verification_sequence: int | None = None
+        self._last_verification_success: bool | None = None
         self.state = AgentState(task=task)
-        self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task},
-        ]
         self._register_finish_tool()
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        """Expose a detached current context for inspection and model calls."""
+
+        return self._context.messages
 
     def run(self) -> AgentRunResult:
         """Run until explicit finish, controlled failure, or MAX_STEPS."""
 
         try:
-            return self._run_loop()
+            result = self._run_loop()
         except KeyboardInterrupt:
             message = "Agent interrupted by user."
             self.state.last_error = message
-            return AgentRunResult(success=False, message=message)
+            result = AgentRunResult(success=False, message=message)
+        if not self.state.finished and self._trace is not None:
+            self._trace.log_terminal(
+                self.state.step_count,
+                result.message,
+                self.state.modified_files,
+                self.state.verification_runs,
+                self._verification_is_current(),
+            )
+        return result
 
     def _run_loop(self) -> AgentRunResult:
         for step in range(1, self._max_steps + 1):
@@ -89,7 +110,7 @@ class AgentCore:
                 self.state.last_error = message
                 return AgentRunResult(success=False, message=message)
 
-            self.messages.append(_assistant_message(response))
+            turn_messages = [_assistant_message(response)]
             for call in response.tool_calls:
                 if call.name == "finish" and len(response.tool_calls) > 1:
                     result = ToolResult(
@@ -105,14 +126,26 @@ class AgentCore:
                     )
                 else:
                     result = self._dispatch(call)
-                self.messages.append(_tool_observation(call.id, result))
+                self._update_state(call, result)
+                turn_messages.append(_tool_observation(call.id, result))
                 if not result.success:
                     self.state.last_error = result.error
-                if self.state.finished:
-                    return AgentRunResult(
-                        success=True,
-                        message=self._final_message(),
+                if self._trace is not None:
+                    self._trace.log_tool(
+                        self.state.step_count,
+                        call.name,
+                        call.arguments,
+                        result,
+                        self.state.modified_files,
+                        self.state.verification_runs,
+                        self._verification_is_current(),
                     )
+            self._context.add_group(turn_messages)
+            if self.state.finished:
+                return AgentRunResult(
+                    success=True,
+                    message=self._final_message(),
+                )
 
         message = f"Agent stopped after reaching MAX_STEPS ({self._max_steps})."
         self.state.last_error = message
@@ -129,6 +162,47 @@ class AgentCore:
                 },
             )
         return self._registry.dispatch(call.name, call.arguments)
+
+    def _update_state(self, call: ToolCall, result: ToolResult) -> None:
+        self._tool_sequence += 1
+        if call.name in {"write_file", "replace_text"} and result.success:
+            self.state.last_edit_step = self.state.step_count
+            self._last_edit_sequence = self._tool_sequence
+        if call.name != "run_command":
+            return
+
+        self._last_verification_success = result.success
+        if result.success:
+            self._latest_successful_verification_sequence = self._tool_sequence
+
+        arguments = call.arguments if isinstance(call.arguments, dict) else {}
+        command = result.metadata.get("command", arguments.get("command", ""))
+        result_text = "\n".join(
+            part
+            for part in (result.error, result.output)
+            if isinstance(part, str) and part
+        ) or "(no output)"
+        concise_result, _ = truncate_text(result_text, 1_000)
+        self.state.verification_runs.append(
+            {
+                "command": command,
+                "step": self.state.step_count,
+                "exit_code": result.metadata.get("exit_code"),
+                "success": result.success,
+                "result": concise_result,
+            }
+        )
+
+    def _verification_is_current(self) -> bool:
+        if self._last_verification_success is not True:
+            return False
+        if self._last_edit_sequence is None:
+            return True
+        return (
+            self._latest_successful_verification_sequence is not None
+            and self._latest_successful_verification_sequence
+            > self._last_edit_sequence
+        )
 
     def _register_finish_tool(self) -> None:
         self._registry.register(
@@ -172,11 +246,31 @@ class AgentCore:
                 metadata={"tool": "finish", "error_type": "invalid_arguments"},
             )
 
-        self.state.final_summary = summary.strip()
-        self.state.final_verification = verification.strip()
-        self.state.final_limitations = (
+        normalized_limitations = (
             limitations.strip() if limitations and limitations.strip() else None
         )
+        if (
+            self.state.last_edit_step is not None
+            and not self._verification_is_current()
+            and normalized_limitations is None
+        ):
+            return ToolResult(
+                success=False,
+                error=(
+                    "Source changes are not covered by a later successful "
+                    "verification run. Use run_command for an appropriate "
+                    "verification, or explicitly report why verification is "
+                    "unavailable in limitations."
+                ),
+                metadata={
+                    "tool": "finish",
+                    "error_type": "verification_required",
+                },
+            )
+
+        self.state.final_summary = summary.strip()
+        self.state.final_verification = verification.strip()
+        self.state.final_limitations = normalized_limitations
         self.state.finished = True
         return ToolResult(
             success=True,

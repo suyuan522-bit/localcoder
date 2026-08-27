@@ -11,10 +11,8 @@ from config import (
     MAX_COMMAND_TIMEOUT_SECONDS,
     MAX_TOOL_OUTPUT_CHARS,
 )
-from tools.base import ToolResult
+from tools.base import ToolResult, truncate_text
 from tools.workspace import Workspace
-
-_OUTPUT_TRUNCATION_MARKER = "\n[output truncated]\n"
 
 
 def _is_dangerous(command: str) -> bool:
@@ -64,15 +62,7 @@ def _format_output(stdout: str, stderr: str) -> str:
 
 
 def _truncate_output(output: str) -> tuple[str, bool]:
-    if len(output) <= MAX_TOOL_OUTPUT_CHARS:
-        return output, False
-    available = MAX_TOOL_OUTPUT_CHARS - len(_OUTPUT_TRUNCATION_MARKER)
-    head_size = available // 2
-    tail_size = available - head_size
-    return (
-        output[:head_size] + _OUTPUT_TRUNCATION_MARKER + output[-tail_size:],
-        True,
-    )
+    return truncate_text(output, MAX_TOOL_OUTPUT_CHARS)
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
