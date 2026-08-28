@@ -70,9 +70,76 @@ compileall exited with code 0
 
 默认测试全部确定性运行，不访问真实或付费 LLM API。覆盖工作区 pathspec、工作区外文件排除、暂存差异、未跟踪文件、长 diff 截断、非 Git 回退、工具注册、Trace 正文省略、最终 changed-files 汇总，以及真实 Todo 基线上的“编辑测试 → 失败验证 → 编辑实现 → 成功验证 → diff → finish”完整循环。
 
-## 真实模型端到端运行
+## 原始 Phase 5 的真实模型状态
 
-本机在 Process、User 和 Machine 三个作用域均未发现 LLM_API_KEY、LLM_BASE_URL 或 LLM_MODEL，工作区也不存在 .env，因此未发起真实模型或付费 API 请求，也没有伪造实时运行结果。真实模型的工具选择顺序、重试次数和首次实现正确率仍属于模型依赖行为；配置凭据后可针对同一 Todo delete 任务执行真实运行。
+原始 Phase 5 执行期间，本机在 Process、User 和 Machine 三个作用域均未发现 LLM_API_KEY、LLM_BASE_URL 或 LLM_MODEL，工作区也不存在 .env，因此当时未发起真实模型或付费 API 请求，也没有伪造实时运行结果。以下真实模型验证是在 Phase 5 完成并推送后单独执行的后续门禁，不属于原始 Phase 5 执行过程。
+
+## Phase 5 后真实模型门禁
+
+### 验证环境
+
+- Provider：Alibaba Cloud Bailian / DashScope OpenAI-compatible API。
+- Model：qwen3-coder-flash。
+- API 凭据仅通过环境变量临时提供，验证完成后已从 shell session 中移除；仓库和本文档均未记录 API key。
+
+### 验证 1：只读冒烟测试
+
+真实模型收到“检查 Todo demo 且不要修改文件”的任务后，自主调用了以下工具：
+
+~~~text
+list_files
+→ read_file(todo.py)
+→ read_file(tests/test_todo.py)
+→ finish
+~~~
+
+最终 changed files 为空，finish 成功。该测试确认了真实 OpenAI-compatible API 连通性、native tool calling、ToolResult observation 回传和显式 finish 行为。
+
+### 验证 2：真实 Coding Agent 端到端测试
+
+任务：
+
+> Implement a delete command that deletes a todo by ID. Add relevant tests and ensure the full test suite passes. Inspect the final changes before finishing.
+
+观察到的自主执行轨迹：
+
+- 探索工作区并读取实现与测试。
+- 编辑 todo.py 和 tests/test_todo.py。
+- 第一次验证失败。
+- 模型检查失败信息、修改测试并再次验证成功。
+- 继续执行额外验证命令。
+- 成功调用 get_diff 检查最终差异。
+- 成功调用 finish。
+- 共执行 20 个 agent steps。
+- 最终 verification status 为 SUCCESS。
+- 未触发 MAX_STEPS 终止，也未发生 workspace escape。
+
+### 独立复核
+
+代理结束后独立执行：
+
+~~~bash
+python -m pytest -q
+~~~
+
+结果：
+
+~~~text
+7 passed in 0.08s
+~~~
+
+独立 diff 检查确认验证工作区仅修改两个文件：
+
+- tests/test_todo.py：33 insertions。
+- todo.py：29 changed lines，其中 24 insertions、5 deletions。
+
+实现新增 delete_todo()、delete CLI subcommand 和显式 command branching。新增测试覆盖删除现有 ID、保留其他 todos、ID 不存在行为、CLI 成功路径和 CLI 失败路径。人工复核未发现功能问题。
+
+### 门禁结论
+
+Real Model Gate：PASSED。
+
+与确定性 FakeLLMClient 端到端测试不同，本次后续门禁证明了真实 LLM 能够自主使用 LocalCoder 的 native tools，响应首次验证失败并修复工作，检查最终 diff，并通过 finish 正常终止。
 
 ## 设计决策
 
@@ -86,11 +153,11 @@ compileall exited with code 0
 ## 与原计划的偏差
 
 - 计划允许修改 agent.py 与 trace.py，但现有 AgentCore 的最终变更汇总和 trace.py 公共导出已经满足需求，因此未作无意义修改；实际集成点位于 tools/registry.py 和 trace_logger.py。
-- 计划要求在本地凭据可用时运行真实模型；当前三个环境变量均未配置，因此按安全要求跳过实时调用，只保留确定性端到端证据。
+- 计划要求在本地凭据可用时运行真实模型；原始 Phase 5 执行时三个环境变量均未配置，因此当时按安全要求跳过实时调用。真实模型验证随后作为独立的 post-Phase-5 gate 完成，并在本文档中与原始执行记录明确分开。
 
 ## 已知限制
 
-- 实时模型运行尚未在本机验证；不同 OpenAI-compatible provider 的工具调用质量和稳定性可能不同。
+- 真实模型门禁仅覆盖 Alibaba Cloud Bailian / DashScope OpenAI-compatible API 与 qwen3-coder-flash；其他 provider、模型和配置的工具调用质量与稳定性仍可能不同。
 - 非 Git 回退只能显示 AgentState 已知的修改文件，无法重建真实补丁。
 - get_diff 不显示未跟踪文件正文，只列出相对路径；文件经工具编辑后仍会出现在最终 changed-files 汇总中。
 - 12,000 字符上限保留 diff 首尾，超长中间区段会被省略，必要时仍需使用文件读取工具做定点检查。
