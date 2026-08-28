@@ -30,6 +30,8 @@
 
 Todo delete 是主要演示任务：仓库保留只实现 `add`、`list`、`complete` 的受控基线；README 指示在临时副本中只复制 `todo.py` 与 `tests/test_todo.py`，初始化独立 Git 仓库、设置该临时仓库专用的无效示例身份，并提交干净 baseline。随后 agent 自行增加 delete 和测试，`get_diff` 因而展示真实 Git 差异，且不会污染主 fixture 或把任务答案硬编码进运行时。
 
+Phase 6 推送后的演示文档细化为临时 baseline 创建并提交自己的小型 .gitignore，明确忽略 Python/pytest 缓存、编译产物和 todos.json，使 get_diff 聚焦于 todo.py 与 tests/test_todo.py 的有意义变更。该忽略文件仅存在于随机临时工作区，不修改 LocalCoder 仓库级 .gitignore。
+
 ## 测试情况
 
 执行命令：
@@ -97,6 +99,14 @@ README 的临时演示准备流程已实际执行：临时仓库只提交 `todo.
 - 确定性完整测试与 Todo 示例测试：已通过。
 - 本次 live demo：因本地凭据未配置而未重跑；Phase 5 后真实模型门禁作为已有独立证据保留。
 - 目标提交：`docs: prepare LocalCoder submission`。
+
+## Phase 6 后文档细化
+
+临时 Todo Git baseline 现在额外包含自己的 .gitignore，忽略 __pycache__/、.pytest_cache/、*.py[cod] 和 todos.json。该调整避免测试缓存、Python 编译产物及手工 CLI 数据进入临时仓库的 get_diff，保持最终差异聚焦于源码与测试修改。
+
+后续验证在全新临时目录完成：baseline Git status 为空，Todo 测试为 5 passed in 0.07s；pytest 与一次手工 CLI 写入后 Git status 仍为空，全部目标 artifact patterns 均被忽略，get_diff 返回 GET_DIFF_SUCCESS=True 与 GET_DIFF_GIT_REPOSITORY=True，随后安全删除临时目录。
+
+这项 post-Phase-6 refinement 只更新 README.md 与本阶段报告，不改变 LocalCoder 的 runtime behavior、architecture、tools、tests、dependencies，也不修改仓库级 .gitignore。
 
 ## 下一阶段
 

@@ -112,17 +112,25 @@ New-Item -ItemType Directory $demoWorkspace | Out-Null
 Copy-Item .\examples\todo_demo\todo.py $demoWorkspace
 New-Item -ItemType Directory (Join-Path $demoWorkspace 'tests') | Out-Null
 Copy-Item .\examples\todo_demo\tests\test_todo.py (Join-Path $demoWorkspace 'tests\test_todo.py')
+@"
+__pycache__/
+.pytest_cache/
+*.py[cod]
+todos.json
+"@ | Set-Content (Join-Path $demoWorkspace '.gitignore')
 Push-Location $demoWorkspace
 git init -b main
 git config user.name "LocalCoder Demo"
 git config user.email "localcoder-demo@example.invalid"
-git add todo.py tests/test_todo.py
+git add todo.py tests/test_todo.py .gitignore
 git commit -m "demo: establish todo baseline"
 Pop-Location
 python main.py --workspace $demoWorkspace --task "Implement a delete command that deletes a todo by ID. Add relevant tests and ensure the full test suite passes. Inspect the final changes before finishing."
 ```
 
 建议讲解顺序：架构 → 启动 agent → 探索 → 编辑 → 首次验证失败（若发生）→ 根据反馈修正 → 测试通过 → `get_diff` → `finish`。模型可能首次即通过；核心证据仍应是实际测试与 diff，而不是人为制造失败。
+
+这个 .gitignore 只属于临时演示仓库；它忽略 Python/pytest 缓存、编译产物和手工 CLI 可能生成的 todos.json，让 get_diff 聚焦于源码与测试变更，不会修改 LocalCoder 仓库自身的 .gitignore。
 
 ## 验证
 
