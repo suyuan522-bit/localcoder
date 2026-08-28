@@ -14,6 +14,7 @@ _STAGES = {
     "write_file": "EDIT",
     "replace_text": "EDIT",
     "run_command": "VERIFY",
+    "get_diff": "VERIFY",
     "finish": "DONE",
 }
 _GENERIC_SECRET_PATTERNS = (
@@ -122,7 +123,13 @@ class TraceLogger:
         return ", ".join(items) if items else "(omitted)"
 
     def _safe_result(self, tool_name: str, result: ToolResult) -> str:
-        if tool_name == "run_command":
+        if tool_name in {"run_command", "get_diff"}:
+            if tool_name == "get_diff":
+                return (
+                    f"output_chars={len(result.output)}, "
+                    "output_truncated="
+                    f"{result.metadata.get('output_truncated', False)}"
+                )
             return (
                 f"exit_code={result.metadata.get('exit_code')}, "
                 f"timed_out={result.metadata.get('timed_out', False)}, "

@@ -2,7 +2,9 @@ from copy import deepcopy
 from io import StringIO
 import json
 import os
+from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -469,6 +471,7 @@ def test_registered_local_tools_write_file_and_share_modified_state(
     assert agent.state.modified_files == {"result.txt"}
     assert "Changed files: result.txt" in result.message
     assert {tool["function"]["name"] for tool in registry.definitions()} == {
+        "get_diff",
         "list_files",
         "read_file",
         "search_text",
@@ -477,6 +480,226 @@ def test_registered_local_tools_write_file_and_share_modified_state(
         "run_command",
         "finish",
     }
+
+
+def test_trace_classifies_get_diff_as_verification() -> None:
+    trace_output = StringIO()
+    logger = TraceLogger(stream=trace_output)
+
+    logger.log_tool(
+        step=2,
+        tool_name="get_diff",
+        arguments={},
+        result=ToolResult(success=True, output="diff --git a/app.py b/app.py"),
+        changed_files={"app.py"},
+        verification_runs=[],
+        verification_current=False,
+    )
+
+    assert "Step 2 · VERIFY" in trace_output.getvalue()
+
+
+def test_trace_does_not_print_get_diff_content() -> None:
+    trace_output = StringIO()
+    logger = TraceLogger(stream=trace_output)
+    private_value = "ordinary-private-value-not-matching-secret-patterns"
+
+    logger.log_tool(
+        step=2,
+        tool_name="get_diff",
+        arguments={},
+        result=ToolResult(
+            success=True,
+            output=f"+PRIVATE_SETTING={private_value}",
+            metadata={"output_truncated": False},
+        ),
+        changed_files={"settings.py"},
+        verification_runs=[],
+        verification_current=False,
+    )
+
+    rendered = trace_output.getvalue()
+    assert private_value not in rendered
+    assert "output_chars=" in rendered
+
+
+def test_todo_delete_end_to_end_with_fake_llm(tmp_path: Any) -> None:
+    workspace_root = tmp_path / "todo_demo"
+    fixture_root = (
+        Path(__file__).resolve().parents[1] / "examples" / "todo_demo"
+    )
+    shutil.copytree(
+        fixture_root,
+        workspace_root,
+        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    )
+    source_path = workspace_root / "todo.py"
+    tests_path = workspace_root / "tests" / "test_todo.py"
+    source_before = source_path.read_text(encoding="utf-8")
+    tests_before = tests_path.read_text(encoding="utf-8")
+    assert "delete_todo" not in source_before
+    assert "delete_todo" not in tests_before
+
+    tests_after = tests_before.replace(
+        "    complete_todo,\n    list_todos,",
+        "    complete_todo,\n    delete_todo,\n    list_todos,",
+        1,
+    ) + (
+        "\n\ndef test_delete_removes_only_requested_todo(tmp_path: Path) -> None:\n"
+        "    data_file = tmp_path / 'todos.json'\n"
+        "    add_todo(data_file, 'Keep')\n"
+        "    add_todo(data_file, 'Delete')\n"
+        "    assert delete_todo(data_file, 2) is True\n"
+        "    assert delete_todo(data_file, 99) is False\n"
+        "    assert list_todos(data_file) == [\n"
+        "        {'id': 1, 'title': 'Keep', 'completed': False}\n"
+        "    ]\n"
+    )
+    delete_function = (
+        "\n\ndef delete_todo(data_file: str | Path, todo_id: int) -> bool:\n"
+        "    todos = list_todos(data_file)\n"
+        "    remaining = [todo for todo in todos if todo['id'] != todo_id]\n"
+        "    if len(remaining) == len(todos):\n"
+        "        return False\n"
+        "    _save_todos(data_file, remaining)\n"
+        "    return True\n"
+    )
+    source_after = source_before.replace(
+        "\n\ndef build_parser()",
+        delete_function + "\n\ndef build_parser()",
+        1,
+    )
+    source_after = source_after.replace(
+        '    complete_parser.add_argument("todo_id", type=int)\n'
+        "    return parser",
+        '    complete_parser.add_argument("todo_id", type=int)\n'
+        '    delete_parser = commands.add_parser("delete", help="Delete a todo.")\n'
+        '    delete_parser.add_argument("todo_id", type=int)\n'
+        "    return parser",
+        1,
+    )
+    source_after = source_after.replace(
+        "    if complete_todo(args.data_file, args.todo_id):\n"
+        '        print(f"Completed todo {args.todo_id}.")\n'
+        "        return 0",
+        '    operation = complete_todo if args.command == "complete" else delete_todo\n'
+        "    if operation(args.data_file, args.todo_id):\n"
+        '        verb = "Completed" if args.command == "complete" else "Deleted"\n'
+        '        print(f"{verb} todo {args.todo_id}.")\n'
+        "        return 0",
+        1,
+    )
+    _initialize_git_repository(workspace_root)
+    test_command = _python_module_command_with_arguments("pytest", "-q")
+    trace_output = StringIO()
+    fake = FakeLLMClient(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-list",
+                        name="list_files",
+                        arguments={"path": ".", "max_depth": 3},
+                    ),
+                    ToolCall(
+                        id="call-read",
+                        name="read_file",
+                        arguments={"path": "todo.py"},
+                    ),
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-test-edit",
+                        name="write_file",
+                        arguments={
+                            "path": "tests/test_todo.py",
+                            "content": tests_after,
+                        },
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-failed-tests",
+                        name="run_command",
+                        arguments={"command": test_command},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-source-edit",
+                        name="write_file",
+                        arguments={"path": "todo.py", "content": source_after},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-passing-tests",
+                        name="run_command",
+                        arguments={"command": test_command},
+                    )
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(id="call-diff", name="get_diff", arguments={})
+                ]
+            ),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call-finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Implemented Todo deletion by ID.",
+                            "verification": "python -m pytest -q passed.",
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    registry = ToolRegistry()
+    agent = AgentCore(
+        fake,
+        registry,
+        "Implement delete by ID and ensure all tests pass.",
+        max_steps=9,
+        trace_logger=TraceLogger(stream=trace_output),
+    )
+    register_local_tools(
+        registry,
+        Workspace(workspace_root),
+        agent.state.modified_files,
+    )
+
+    result = agent.run()
+
+    assert result.success is True
+    assert agent.state.modified_files == {"tests/test_todo.py", "todo.py"}
+    assert [run["success"] for run in agent.state.verification_runs] == [False, True]
+    assert "Changed files: tests/test_todo.py, todo.py" in result.message
+    diff_observation = next(
+        json.loads(message["content"])
+        for message in fake.requests[6]["messages"]
+        if message.get("tool_call_id") == "call-diff"
+    )
+    assert diff_observation["success"] is True
+    assert "diff --git" in diff_observation["output"]
+    assert "tests/test_todo.py" in diff_observation["output"]
+    assert "todo.py" in diff_observation["output"]
+    rendered_trace = trace_output.getvalue()
+    assert "Tool: get_diff" in rendered_trace
+    assert "Step 6 · VERIFY" in rendered_trace
+    assert "Step 7 · DONE" in rendered_trace
+    assert (workspace_root / "todo.py").read_text(encoding="utf-8") == source_after
 
 
 def test_finish_requires_successful_verification_after_edit(tmp_path: Any) -> None:
@@ -834,4 +1057,45 @@ def _python_module_command(module: str, path: str) -> str:
         subprocess.list2cmdline(arguments)
         if os.name == "nt"
         else shlex.join(arguments)
+    )
+
+
+def _python_module_command_with_arguments(module: str, *arguments: str) -> str:
+    command = [sys.executable, "-m", module, *arguments]
+    return (
+        subprocess.list2cmdline(command)
+        if os.name == "nt"
+        else shlex.join(command)
+    )
+
+
+def _initialize_git_repository(repository: Any) -> None:
+    prefix = [
+        "git",
+        "-c",
+        f"safe.directory={repository}",
+        "-C",
+        str(repository),
+    ]
+    subprocess.run([*prefix, "init"], check=True, capture_output=True)
+    subprocess.run(
+        [*prefix, "config", "user.name", "LocalCoder Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            *prefix,
+            "config",
+            "user.email",
+            "localcoder@example.invalid",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run([*prefix, "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        [*prefix, "commit", "-m", "baseline"],
+        check=True,
+        capture_output=True,
     )

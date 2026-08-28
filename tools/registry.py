@@ -13,6 +13,7 @@ from tools.file_tools import (
     search_text,
     write_file,
 )
+from tools.git_tool import get_diff
 from tools.shell_tool import run_command
 from tools.workspace import Workspace
 
@@ -140,6 +141,9 @@ def register_local_tools(
     ) -> ToolResult:
         return run_command(workspace, command, timeout)
 
+    def handle_get_diff() -> ToolResult:
+        return get_diff(workspace, modified_files)
+
     registry.register(
         "list_files",
         "List a bounded workspace tree.",
@@ -224,4 +228,14 @@ def register_local_tools(
             "additionalProperties": False,
         },
         handle_run_command,
+    )
+    registry.register(
+        "get_diff",
+        "Show a bounded Git diff scoped to the workspace.",
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        handle_get_diff,
     )
